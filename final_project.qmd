@@ -1,0 +1,731 @@
+---
+title: "Segregation and the Racial Wealth Gap in St. Louis, Missouri"
+author: "Matt Miller"
+format: 
+  html:
+    embed-resources: true
+
+editor: visual
+bibliography: references.bib
+---
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| include: false
+
+library(tidycensus)
+library(tidyverse)
+library(segregation)
+library(tigris)
+library(sf)
+library(VIM)
+library(mice)
+library(scales)
+library(car)
+library(stargazer)
+library(sandwich)
+
+
+#set working directory
+setwd('C:/Users/matth/OneDrive - Johns Hopkins/UrbanDataAnalytics/FinalProject')
+
+################################################################################
+#Calculate Segregation Index for Saint Louis
+################################################################################
+
+#Get data from census bureau - 5 year by tract
+pop_data <- get_acs(
+      geography = 'tract',
+      state = 'MO',
+      variables = c(
+        white = 'B03002_003',
+        black = 'B03002_004',
+        asian = 'B03002_006',
+        hispanic = 'B03002_012'
+        ),
+      geometry = TRUE,
+      year = 2019
+    )
+
+#Get US Urban Areas with geometry
+us_urban_areas <- get_acs(
+  geography = 'urban area',
+  variables = 'B01001_001',
+  geometry = TRUE,
+  year = 2019,
+  survey = 'acs1'
+) %>%
+  filter(estimate >= 200000) %>%
+  mutate(urban_name = str_remove(NAME,",.*$"))
+
+#Merge tables together for segregation data
+mo_urban_data <- pop_data %>%
+  st_join(us_urban_areas,left = F) %>%
+  dplyr::select(-NAME.x, -NAME.y) %>%
+  st_drop_geometry()
+
+#Filter data to saint Louis and get segregation data
+stl_urban_data_segregation <- mo_urban_data %>%
+  filter(urban_name == 'St. Louis',
+         variable.x %in% c('white','black')) %>%
+  mutual_local(
+    group = 'variable.x',
+    unit = 'GEOID.x',
+    weight = 'estimate.x',
+    wide = TRUE
+  )
+
+#Merge tracts with STL segregation index data
+stl_tracts_seg <- tracts("MO", cb = TRUE, year = 2019) %>%
+  inner_join(stl_urban_data_segregation, by = c("GEOID" = "GEOID.x")) %>%
+  st_drop_geometry()
+
+################################################################################
+#Get Other Variables and Merge with Segregation Data
+################################################################################
+
+acs_five_year_data <- get_acs(
+  geography = 'tract',
+  state = 'MO',
+  variables = c(
+    medinc_black = 'B19013B_001',
+    medinc_white = 'B19013A_001',
+    white = 'B03002_003',
+    black = 'B03002_004',
+    white_owner_occupied = 'B25003A_002',
+    white_occupied_housing = 'B25003A_001',
+    black_owner_occupied = 'B25003B_002',
+    black_occupied_housing = 'B25003B_001',
+    white_male_bachelors = 'C15002A_006',
+    white_female_bachelors = 'C15002A_011',
+    white_estimate_25_and_older = 'C15002A_001',
+    black_male_bachelors = 'C15002B_006',
+    black_female_bachelors = 'C15002B_011',
+    black_estimate_25_and_older = 'C15002B_001',
+    white_under_19_health_insurance = 'C27001A_003',
+    white_19_to_64_health_insurance = 'C27001A_006',
+    white_65_and_older_health_insurance = 'C27001A_009',
+    white_noninstitutionalized_pop = 'C27001A_001',
+    black_under_19_health_insurance = 'C27001B_003',
+    black_19_to_64_health_insurance = 'C27001B_006',
+    black_65_and_older_health_insurance = 'C27001B_009',
+    black_noninstituitionalized_pop = 'C27001B_001',
+    married_household_w_children = 'B09005_002',
+    cohabitating_household_w_children = 'B09005_003',
+    toal_w_children = 'B09005_001'
+  ),
+  geometry = TRUE,
+  output = 'wide',
+  year = 2019,
+  survey = 'acs5'
+)
+
+
+#Merge segregation index with other data. Create proportions and remove NAs/update NaNs to 0
+dat_joined <- inner_join(acs_five_year_data, stl_tracts_seg, by = 'GEOID') %>% mutate(wealth_gap = medinc_whiteE / medinc_blackE)
+
+
+#Manipulate the data to user-friendly variables
+dat_joined_manip <- dat_joined %>%
+  mutate(
+    white_owner_prop = white_owner_occupiedE / white_occupied_housingE,
+    black_owner_prop =  black_owner_occupiedE / black_occupied_housingE,
+    white_bachelors_prop = (white_male_bachelorsE + white_female_bachelorsE) / white_estimate_25_and_olderE,
+    black_bachelors_prop = (black_male_bachelorsE + black_female_bachelorsE) / black_estimate_25_and_olderE,
+    black_health_insurance_coverage_prop = 
+      (black_under_19_health_insuranceE + black_19_to_64_health_insuranceE + black_65_and_older_health_insuranceE) / black_noninstituitionalized_popE,
+    white_health_insurance_coverage_prop = 
+      (white_under_19_health_insuranceE + white_19_to_64_health_insuranceE + white_65_and_older_health_insuranceE) / white_noninstitutionalized_popE,
+    parents_in_household_prop = (married_household_w_childrenE + cohabitating_household_w_childrenE) / toal_w_childrenE,
+    wealth_gap = medinc_whiteE / medinc_blackE
+  ) %>%
+  dplyr::select('GEOID', 'NAME.x', 'medinc_blackE', 'medinc_whiteE', 'wealth_gap', 'white_owner_prop', 'black_owner_prop', 
+                'white_bachelors_prop', 'black_bachelors_prop', 'white_health_insurance_coverage_prop', 'black_health_insurance_coverage_prop', 
+                'parents_in_household_prop', 'ls', 'p', 'geometry') %>%
+  rename('NAME' = 'NAME.x',
+         'segregation' = 'ls',
+         'white_median_income' = 'medinc_whiteE',
+         'black_median_income' = 'medinc_blackE')
+
+#Convert to Long Format
+dat_joined_long <- dat_joined_manip %>% pivot_longer(cols = c(wealth_gap, white_owner_prop, 
+                                                              black_owner_prop, white_bachelors_prop, black_bachelors_prop, 
+                                                              black_health_insurance_coverage_prop,parents_in_household_prop,
+                                                              white_health_insurance_coverage_prop, segregation),
+                                                     names_to = 'variables',
+                                                     values_to = 'value')
+#Get Summary Table
+
+stargazer_statistics <- dat_joined_manip %>% dplyr::select(c(-p, -black_median_income, -white_median_income))
+
+stargazer_output <- stargazer(data.frame(stargazer_statistics), title = "Descriptive Statistics", digits = 2, median = T, iqr = T, nobs = T, type = 'html', out = 'foo.html')
+
+
+################################################################################
+#Evaluate Missingness
+################################################################################
+
+dat_evaluate <- dat_joined %>%
+  st_drop_geometry() %>%
+  dplyr::select("medinc_blackE", "medinc_whiteE") %>%
+  marginplot( xlab = 'Median Black Income',
+              ylab = 'Median White Income',
+              main = 'Marginplot of Median Black and White Income for Missingness')
+
+#Pbox
+pbox <- dat_joined %>% 
+  dplyr::select('medinc_whiteE', 'medinc_blackE') %>%
+  st_drop_geometry() %>% pbox(pos = 1, labels = TRUE, axes = TRUE,
+                              xlab = 'Median Black Income',
+                              ylab = 'Median White Income',
+                              main = 'Distribution of Median Black and White Income with Missingness')
+
+#Impute missing values with MICE
+mice_imp <- mice(dat_joined,
+                 m = 1,
+                 method = 'cart')
+
+data_imp <- complete(mice_imp) %>% st_drop_geometry()
+
+#Evaluate fit
+formula_fit <- medinc_blackE ~ medinc_whiteE
+xyplot(x = mice_imp, data = formula_fit,
+       xlab = 'Median White Income',
+       ylab = 'Median Black Income',
+       main = 'Scatterplot of Median Black and White Income with Imputed Values')
+densityplot(x = mice_imp, data = medinc_blackE ~ medinc_whiteE + medinc_blackE)
+
+################################################################################
+#Conduct Univariate Analysis
+################################################################################
+
+dat_joined_manip <- dat_joined %>%
+  subset(., !is.na(medinc_blackE) & !is.na(medinc_whiteE)) %>%
+  mutate(
+  white_owner_prop = white_owner_occupiedE / white_occupied_housingE,
+  black_owner_prop =  black_owner_occupiedE / black_occupied_housingE,
+  white_bachelors_prop = (white_male_bachelorsE + white_female_bachelorsE) / white_estimate_25_and_olderE,
+  black_bachelors_prop = (black_male_bachelorsE + black_female_bachelorsE) / black_estimate_25_and_olderE,
+  black_health_insurance_coverage_prop = 
+    (black_under_19_health_insuranceE + black_19_to_64_health_insuranceE + black_65_and_older_health_insuranceE) / black_noninstituitionalized_popE,
+  white_health_insurance_coverage_prop = 
+    (white_under_19_health_insuranceE + white_19_to_64_health_insuranceE + white_65_and_older_health_insuranceE) / white_noninstitutionalized_popE,
+  parents_in_household_prop = (married_household_w_childrenE + cohabitating_household_w_childrenE) / toal_w_childrenE,
+  wealth_gap = medinc_whiteE / medinc_blackE
+) %>%
+  dplyr::select('GEOID', 'NAME.x', 'wealth_gap', 'white_owner_prop', 'black_owner_prop', 
+                'white_bachelors_prop', 'black_bachelors_prop', 'white_health_insurance_coverage_prop', 'black_health_insurance_coverage_prop', 
+                'parents_in_household_prop', 'ls', 'p', 'geometry') %>%
+  rename('NAME' = 'NAME.x',
+         'segregation' = 'ls') %>%
+  na.omit()
+
+
+
+#Create univariate plots for all variables
+dat_joined_long <- dat_joined_manip %>% pivot_longer(cols = c(wealth_gap, white_owner_prop, 
+                                                        black_owner_prop, white_bachelors_prop, black_bachelors_prop, 
+                                                        black_health_insurance_coverage_prop,parents_in_household_prop,
+                                                        white_health_insurance_coverage_prop, segregation),
+                                               names_to = 'variables',
+                                               values_to = 'value')
+
+#Get summary statistics
+
+stargazer_output_new <- dat_joined_manip %>% dplyr::select(c(-p)) %>% data.frame(.) %>% stargazer(title = 'Descriptive Statistics', digits = 2, median = T, iqr = T, nobs = T, type = 'html', out = 'foo2.html')
+
+
+#plot histograms
+ggplot(dat_joined_long, aes(x = value)) +
+  geom_density() + 
+  facet_wrap(~variables, scales = 'free') +
+  ggtitle('Distributions of Continuous Variables')
+
+#Plot Scatterplot of each variable relative to wealth gap
+dat_scatter_long <- dat_joined_manip %>% pivot_longer(cols = c(white_owner_prop, 
+                                                               black_owner_prop, white_bachelors_prop, black_bachelors_prop, 
+                                                               black_health_insurance_coverage_prop,parents_in_household_prop,
+                                                               white_health_insurance_coverage_prop, segregation),
+                                                      names_to = 'variables',
+                                                      values_to = 'value')
+
+
+ggplot(dat_scatter_long, aes(x = value, y = wealth_gap)) +
+  geom_point() +
+  geom_smooth() +
+  facet_wrap(~variables, scales = 'free') +
+  ggtitle('Scatterplot of Continous Variables Relative to Wealth Gap')
+
+
+
+
+#Assess outliers with a box a whisker plot
+ggplot(dat_joined_long, aes( y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variables, scales = 'free') +
+  ggtitle('Boxplots of Continuous Variables')
+
+  
+################################################################################
+#Build Models
+################################################################################
+
+#This model has multiple problems
+model1 <-  lm(data = dat_joined_manip, wealth_gap ~ black_bachelors_prop + 
+                black_health_insurance_coverage_prop + black_owner_prop + 
+                parents_in_household_prop + segregation + white_owner_prop +
+                white_bachelors_prop + white_health_insurance_coverage_prop)
+
+summary(model1)
+
+plot(model1)
+
+
+################################################################################
+#Transformations
+################################################################################
+
+updated_dat <-  dat_joined_manip %>% 
+  mutate(log_wealth_gap = log(wealth_gap),
+         black_bachelors_prop = if_else(black_bachelors_prop == 0, black_bachelors_prop + .000001, black_bachelors_prop),
+         log_black_bachelors_prop = log(black_bachelors_prop),
+         white_bachelors_prop = if_else(white_bachelors_prop == 0, white_bachelors_prop + .000001, white_bachelors_prop),
+         log_white_bachelors_prop = log(white_bachelors_prop),
+         black_health_insurance_coverage_prop = if_else(black_health_insurance_coverage_prop == 0, 
+                                                        black_health_insurance_coverage_prop + .000001, black_health_insurance_coverage_prop),
+         log_black_health_insurance_coverage_prop = log(black_health_insurance_coverage_prop),
+         white_health_insurance_coverage_prop = if_else(white_health_insurance_coverage_prop == 0, 
+                                                        white_health_insurance_coverage_prop + .000001, white_health_insurance_coverage_prop),
+         log_white_health_insurance_coverage_prop = log(white_health_insurance_coverage_prop),
+         black_owner_prop = if_else(black_owner_prop == 0, black_owner_prop + .000001, black_owner_prop),
+         log_black_owner_prop = log(black_owner_prop),
+         white_owner_prop = if_else(white_owner_prop == 0, white_owner_prop + .000001, white_owner_prop),
+         log_white_owner_prop = log(white_owner_prop),
+         segregation = if_else(segregation == 0, segregation + .000001, segregation),
+         log_segregation = log(segregation),
+         parents_in_household_prop = if_else(parents_in_household_prop == 0, .000001, parents_in_household_prop),
+         log_parents_in_household = log(parents_in_household_prop),
+         sqrt_black_health_insurance_coverage_prop = sqrt(black_health_insurance_coverage_prop),
+         sqrt_white_health_insurance_coverage_prop = sqrt(white_health_insurance_coverage_prop)
+         )
+
+dat_joined_long_rev <- updated_dat %>% pivot_longer(cols = c(log_wealth_gap, white_owner_prop, 
+                                                        black_owner_prop, white_bachelors_prop, log_black_bachelors_prop, 
+                                                        sqrt_black_health_insurance_coverage_prop,parents_in_household_prop,
+                                                        sqrt_white_health_insurance_coverage_prop, log_segregation),
+                                               names_to = 'variables',
+                                               values_to = 'value')
+
+ggplot(dat_joined_long_rev, aes(x = value)) +
+  geom_density() + 
+  facet_wrap(~variables, scales = 'free') +
+  ggtitle('Distributions of Continuous Variables')
+
+
+write_csv(updated_dat, 'transformed_dataset.csv')
+write_csv(dat_joined, 'original_dataset.csv')
+
+#Create Model 2
+
+
+
+model2 <- lm(data = updated_dat, log_wealth_gap ~ log_black_bachelors_prop + 
+                sqrt_black_health_insurance_coverage_prop + black_owner_prop + 
+                parents_in_household_prop + log_segregation + white_owner_prop +
+                white_bachelors_prop + sqrt_white_health_insurance_coverage_prop)
+
+summary(model2)
+
+model2$rse <- sqrt(diag(vcovHC(model2, type="HC1")))
+
+stargazer(model2, se = list(model2$rse), type = 'html', title = 'Racial Wealth Gap Drivers', digits = 2, out = 'regression_first_model.html')
+
+plot(model2)
+
+#Create Model 3
+model3 <- lm(data = updated_dat, log_wealth_gap ~ log_black_bachelors_prop + 
+               black_owner_prop + parents_in_household_prop +  white_owner_prop +
+               white_bachelors_prop)
+
+summary(model3)
+
+model3$rse <- sqrt(diag(vcovHC(model3, type="HC1")))
+
+stargazer(model3, se = list(model3$rse), type = 'html', title = 'Racial Wealth Gap Drivers', digits = 2, out = 'regression_second_model.html')
+
+plot(model3)
+
+
+
+
+################################################################################
+#Visualization
+################################################################################
+
+#Make map of the racial wealth gap
+dat_joined %>%
+  ggplot(aes(fill=wealth_gap, text = paste0('Local Segregation Index:', ' ', round(wealth_gap, 2)))) +
+  geom_sf(color = NA) +
+  coord_sf(crs = 26946) +
+  scale_fill_gradient2(low = "blue", mid = "blue", high = "red", na.value = "grey50", limits = c(0, 9)) +
+  theme_void() +
+  labs(title = 'Saint Louis Racial Wealth Gap by Census Tract',
+       fill = 'Wealth Gap\nEstimate',
+       caption = '*Wealth gap estimate is the Median White income divided by the Median Black income
+       *Insufficient Data for census tracts deliniated in gray
+                  ')
+
+#Median Black Income
+dat_joined %>%
+  ggplot(aes(fill=medinc_blackE, text = paste0('Local Segregation Index:', ' ', round(medinc_blackE, 2)))) +
+  geom_sf(color = NA) +
+  coord_sf(crs = 26946) +
+  scale_fill_viridis_c(option = 'inferno', labels = scales::dollar_format()) +
+  theme_void() +
+  labs(title = 'Saint Louis Median Black Income by Census Tract',
+       fill = 'Median Black Income')
+
+#Median White Income
+dat_joined %>%
+  ggplot(aes(fill=medinc_whiteE, text = paste0('Local Segregation Index:', ' ', round(medinc_whiteE, 2)))) +
+  geom_sf(color = NA) +
+  coord_sf(crs = 26946) +
+  scale_fill_viridis_c(option = 'inferno', labels = scales::dollar_format()) +
+  theme_void() +
+  labs(title = 'Saint Louis Median White Income by Census Tract',
+       fill = 'Median White Income')
+
+#Segregation
+segregation_map <- dat_joined %>%
+  ggplot(aes(fill=ls, text = paste0('Local Segregation Index:', ' ', round(ls, 2)))) +
+  geom_sf(color = NA) +
+  coord_sf(crs = 26946) +
+  scale_fill_viridis_c(option = 'inferno') +
+  theme_void() +
+  labs(title = 'Saint Louis Segregation by Census Tract',
+       fill = 'Local\nSegregation Index')
+
+
+```
+
+![](stl_skyline.jpg){fig-align="center"}
+
+#### Final Research Project
+
+#### Urban Data Analytics
+
+#### Fall 2023
+
+# Executive Summary
+
+Given data from the United States Census Bureau, it's clear that the city of St. Louis, Missouri hosts much segregation between the Black and White populations (@fig-one). While it's possible to see where segregation exists in the city within the figure, it's not possible to understand the negative economic impacts of segregation on the economic livelihoods of its Black citizens, the citizens that have historically suffered under segregation. Therefore, the analysis outlined in this document explores the relationship between segregation and the White/Black wealth gap, a measure that captures the difference in wealth between the White and Black populations. It also explores the impact of other variables of interest on the wealth gap like homeownership, education attainment, health insurance, and family stability.
+
+Ultimately, the investigation into these variables concluded that education attainment, homeownership, and family stability have a statistically significant relationship with the wealth gap of St. Louis. It's notable that segregation does not have a statistically significant relationship with the wealth gap.
+
+```{r}
+#| warning: false
+#| message: false
+#| label: fig-one
+#| echo: false
+#| fig-cap: "Map of Segregation in Saint Louis, Missouri. Higher values indicate higher levels of segregation. Map geometry collected using the Tigris package [@Tigris] while segregation data was collected using the TidyCensus package [@TidyCensus]. Calculations for segregation were computed using the Segregation package [@Segregation]."
+#| fig-pos: h
+
+dat_joined %>%
+  ggplot(aes(fill=ls, text = paste0('Local Segregation Index:', ' ', round(ls, 2)))) +
+  geom_sf(color = NA) +
+  coord_sf(crs = 26946) +
+  scale_fill_viridis_c(option = 'inferno') +
+  theme_void() +
+  labs(title = 'Saint Louis Segregation by Census Tract',
+       fill = 'Local\nSegregation Index')
+```
+
+# Topic and Research Question
+
+## Research Question
+
+The research question associated with the analysis asks if increasing levels of segregation result in increasing levels of the wealth gap in St. Louis. Addressing the research question is important as it provides valuable context of the St. Louis area's main drivers of the wealth gap, thus enabling policymakers to formulate policies that can help promote economic opportunity for the Black population, a population that generally earns less income relative to its White counterpart.
+
+In assessing the research question it's possible to understand the statistically significant drivers of the wealth gap from the chosen variables of interest. Furthermore, it's possible to understand if the legacy of segregation in St. Louis has a meaningful relationship with the wealth gap.
+
+## Background Information
+
+To understand the research question more thoroughly, it's necessary to provide background on segregation and the wealth gap in St. Louis. In terms of segregation, the city of Saint Louis, is home to high levels of segregation between Black and White populations due to a history of racial housing covenants [@Cooperman]. The racial housing covenants, initially created in 1916, "prevented anyone from buying a home in a neighborhood more than 75% occupied by another race [@Cooperman]\]. When this specific practice was made illegal by the Buchanan v. Warley decision in the Supreme Court,"St. Louisans reverted to a different variety of housing covenant where every family on a block or in a subdivision had to sign a legal document promising to never sell to an African American" [@Cooperman].  While the racial housing covenants requiring owners to never sell to African Americans were made illegal in 1948 following the Shelley v. Kraemer ruling at the Supreme Court, the legacy of racial housing covenants are still visible in the city today [@Cooperman]\].  
+
+In addition to housing, division among the Black and White populations is also palpable given the respective wealth of each population. From a census tract perspective, the White population of Saint Louis has 1.72 times the wealth of the Black population (see wealth_gap mean of Figure @fig-3) . The wealth gap between the populations leaves the Black population at a disadvantage relative to the White population across multiple facets that include but are not limited to education, wealth appreciation, inheritance, etc.
+
+Overall, there are clear divisions between the Black and White populations in terms of where residents live and how much wealth they have in the city of St. Louis. The subsequent analysis will attempt to understand if the two divisions are related.
+
+# Key Concepts and Variables
+
+Key concepts driving the investigation into the wealth gap are numerous. The key concepts provided below are from the perspective of the Black population. One key concept, home ownership, illustrates the idea that owning a home provides the homeowner with the ability to accrue wealth through appreciation and equity. The wealth accrued to the homeowner is then theoretically available to the next of kin after the homeowner's death, thus increasing the total amount of wealth accrued to family members. Next, having health insurance implies that one can obtain needed health services, thus promoting economic productivity. Therefore, it's expected that residents with health insurance will have higher levels of economic productivity and income, thus increasing the amount of wealth accrued to them. Family stability, defined as a family with two parents for this study, is expected to affect the accruement of wealth as stable families are in a better position to combine financial resources between partners. Education confers additional skills, and additional skills are largely associated with higher earning potential and wealth. Therefore, it's expected that additional education will decrease the wealth gap. Segregation is expected to have a negative impact on wealth accumulation as segregated communities often host more poverty and diminished public services, thus negatively affecting future earnings prospects for residents.
+
+The variables outlined in Table 1 below were computed using variables from the 2019 Five Year American Community Survey (ACS) from the United States Census Bureau . The computed variables align closely to the key concepts above. More information on how the variables outlined below were computed using information from the 2019 ACS can be found in Table A and Note A of the Appendix.
+
+**Table 1**
+
++---------------------------+------------------------------------------------------------------------+
+| Variable                  | Description                                                            |
++===========================+========================================================================+
+| ```                       | Median White Income divided by the Median Black Income                 |
+| wealth_gap                |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Proportion of Black population with a bachelor's degree                |
+| black_bachelors_prop      |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Proportion of Black population with health insurance                   |
+| black_health_insurance_   |                                                                        |
+| coverage_prop             |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Proportion of Black population that own homes                          |
+| black_owner_prop          |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Proportion of households that have two caregivers for children present |
+| parents_in_household_prop |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Local segregation index                                                |
+| segregation               |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Proportion of White population that own homes                          |
+| white_owner_prop          |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Proportion of White Population with a bachelor's degree                |
+| white_bachelors_prop      |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+| ```                       | Proportion of White population with health insurance                   |
+| white_health_insurance_   |                                                                        |
+| coverage_prop             |                                                                        |
+| ```                       |                                                                        |
++---------------------------+------------------------------------------------------------------------+
+
+: Computed Variables used in Analysis
+
+Finally, it's worth noting that because the data in the variables come from a survey, the data are estimates of the population of St. Louis. Furthermore, the data was provided by respondents that may or may not have provided truthful answers. As a result of population estimation and survey response, it's possible that the data is biased.
+
+## Potential Limitations of Variables
+
+The wealth gap for the study is computed as the White Median Income divided by the Black Median Income. While Median Income represents earnings, it does not represent total assets. As a result, it's possible that the wealth gap measured in total assets between the White and Black populations is different relative to the Median White and Black Income computation. Next, Segregation is a calculation derived from via the 'Local Segregation Index' methodology. This approach uses multi-group segregation indices, which enables researchers to measure segregation among multiple groups like census tracts. While useful, the Local Segregation Index relies on a specific formulaic interpretation of segregation (see the segregation package @Segregation) . It's possible that other formulaic interpretations are more accurate for the purpose of this study. Finally, the Family Stability variable is captured in the data as the proportion of families with two parents in the same household. Overall, the relationship between the two parents is not given in the data. As a result, it's possible that different types of relationships between the two parents have better predictive capacity of the wealth gap in St. Louis.
+
+# Hypothesis and Theoretical Rationale
+
+The analysis is based around the bivariate hypothesis that as segregation increases, the wealth gap increases. The rationale behind the hypothesis rests upon the idea that the distribution of wealth is rooted within a racist foundation that found the Black population restricted from buying property in wealthier neighborhoods, thus making it much more difficult for their communities to accrue wealth over time. For example, if a Black person had the funds to procure a house in a wealthy neighborhood while the racist housing covenants were in place, they were unable to legally do so. Instead, they were forced to buy a home in an area reserved for the black population where the public services were worse, and the housing prices were lower. Low housing prices coupled with poor public services led to a lack of appreciation in homes, meaning that intergenerational wealth was not accrued and passed down at the same rate as for White households. Furthermore, the poor public services meant that education was worse, leading to worse economic outcomes and lower rates home ownership on average for residents. The lack of high quality police, fire, and medical services meant that people were in danger more often and as a result, more stressed. This created a cycle of desperation and poverty that was very difficult to escape, even legally speaking. On the other hand, White residents procuring property at the time of the racist housing covenants had the ability to choose homes from mostly affluent areas with good public services and higher home values. As a result, the homes appreciated more, thus enabling higher transfers of intergenerational wealth. Better public services in these areas meant that education could be obtained publicly while police, fire, and medical services helped keep the population stress free. Overall, the cycle of poverty did not occur in these communities. Once this process started in the White and Black communities, it progressed, thus trapping many Black residents in a cycle of poverty while sparing many of the White residents. The areas that are predominantly White have a higher accumulation of wealth and prosperity while the Black communities have lower accumulations of wealth and prosperity. Therefore, I theorize that high rates of segregation increase the wealth gap between the White and Black populations.
+
+# Methods and Data Sources
+
+As previously mentioned, the data for the analysis originates from the 2019 Five Year ACS. Data from the Five Year ACS is collected over 60 months and has the largest sample size of any ACS survey, meaning that the results more closely resemble the population [@CensusBureau]. Furthermore, the survey includes "estimates from over 40 topics for communities across the nation that include language, education, commuting, employment, mortgage status, rent, income, poverty and health insurance [@CensusBureau].  The data from the ACS was procured using the tidycensus [@TidyCensus] package in R. The package utilizes an Application Programming Interface (API) to connect users directly to the data at the Census Bureau.
+
+To test the hypothesis that increasing levels of segregation leads to an increasing wealth gap, a multiple linear regression modeling technique was employed.
+
+# Findings
+
+While multiple linear regression is a useful tool in understanding statistical significance and the degree and direction of variables, it's made more useful if the dataset is thoroughly analyzed from a descriptive statistic and a univariate perspective. The descriptive statistics shown in @fig-2 are associated with the constructed variables that align to the key concepts outlined in the previous section. Please take note of the 207 missing values under the wealth_gap variable. The large number of missing values relative to the total number of observations led to an exploratory data analysis into the missing data to better understand if Multiple Imputation by Chained Equations (MICE) could adequately impute the missing data. While the scatterplot shown in Appendix @fig-a MICE appear appropriate, the density plot shown in Appendix @fig-b indicates that the distribution of imputed values for Median Black and White Income, the two variables that constitute the Wealth Gap, vary drastically from their actual distributions. Therefore, the large respective number of observations were removed from the data as imputation did not appear appropriate for the study. The updated descriptive statistics after missing values were removed are shown in @fig-3.
+
+![Summary Statistics for Saint Louis Dataset. Data Originates from the 2019 ACS via TIdycensus @TidyCensus. Graphic generated with Stargazer @Stargazer .](summary_stats.png){#fig-2 fig-align="center"}
+
+![Summary Statistics Excluding Missing Values. Data Originates from the 2019 ACS via TIdycensus @TidyCensus. Graphic generated with Stargazer @Stargazer .](summary_stats_updated.png){#fig-3 fig-align="center"}
+
+In terms of univariate analysis, the distributions of the variables aligned to the key concepts are shown in @fig-4 black_bachelors_prop, segregation, and wealth_gap indicate strong right skewness while black_health_insurance_coverage_prop and white_health_insurance_coverage_prop indicate strong left skewness. As a result, variables with left skewness were transformed using a logarithmic transformation while variables with right skewness were transformed using a square root transformation. The updated distributions are shown in @fig-5 . Please note that four values of black_bachelors_prop had values of 0, so a small constant of .000001 was added so that the logarithmic transformation could be performed.
+
+![Univariate Distributions of Variables. Data Originates from the 2019 ACS via TIdycensus @TidyCensus . Graphic Generated with Tidyverse @Tidyverse .](histograms.png){#fig-4 fig-align="center"}
+
+![Univariate Distributions After Transformations. Data Originates from the 2019 ACS via TIdycensus @TidyCensus . Graphic Generated with Tidyverse @Tidyverse .](distributions_rev.png){#fig-5 fig-align="center"}
+
+With variables transformed, multiple linear regression was utilized to understand the strength and direction of the relationships of the independent variables relative to the wealth_gap variable. The output of the first regression is shown in @fig-6 Please take note of the statistically insignificant variables, sqrt_black_health_insurance_coverage_prop, log_segregation, and sqrt_white_health_insurance_coverage_prop. Because the variables were insignificant, they were pruned from the model. The model in @fig-7 shows only the statistically significant variables in the model. Overall, the regression output indicates that 25 percent of the variability in the wealth gap is accounted for using the statistically significant variables. Furthermore, the model indicates that segregation does not have a statistically significant relationship with the wealth gap, but black and white bachelor's attainment, black and white homeownership, and family stability do have a statistically significant relationship with the wealth gap. With this information, it's possible to partially disconfirm the hypothesis that as segregation increases, the wealth gap increases too. In terms of the coefficients, it's possible to discern that a one percent change in the proportion of the black population that holds a bachelor's degree is associated with a decrease in the White/Black wealth of -0.04 percent, a one unit increase in the proportion of Black homeowners is associated with a decrease in the wealth gap of -0.85 percent, a one unit increase in the proportion of households with two parents is associated with a decrease in the wealth gap of -0.46 percent, a one unit increase in the proportion of White homeowners is associated with an increase in the wealth gap of 0.62, and a one unit increase in the proportion of Whites with bachelor's degrees is associated with an increase in the wealth gap of 1.17 percent. The difference in coefficients between White bachelor's attainment and Black bachelor's attainment is notable as the coefficient for White attainment is 26 times larger than the coefficient for Black bachelor's attainment. This indicates that being White with a bachelor's degree is associated with much more income relative being Black with a bachelor's degree. Finally, plots validating normality, homoscedasticity, and presence of no outliers (as measured by Cook's distance) are shown in the Appendix under Figures @fig-c , @fig-d , @fig-e , and @fig-f respectively.
+
+![Regression Model with All Variables. Graphic Generated with Stargazer @Stargazer](regression_one.png){#fig-6 fig-align="center"}
+
+![Regression Model with Statistically Significant Variables. Graphic Generated with Stargazer @Stargazer](regression_two.png){#fig-7 fig-align="center"}
+
+# Discussion
+
+Overall, the hypothesis that increasing levels of segregation in associated with increasing levels of wealth gap in St. Louis was partially disconfirmed through the analysis as segregation was not statistically significant in its relationship to the wealth gap for the subset of census tracts in the model. That said, it's possible that including the missing census tract values might change the conclusion. While it was surprising that segregation did not have a statistically significant relationship with the wealth gap for the available data, it was very surprising how different the coefficients of the regression output were for Black bachelor's attainment and White bachelor's attainment. Clearly, there are other variables at work that were not captured in the study that contribute to the degree to which income is earned through bachelor's degrees from the Black and White populations. Based on the results, I'm interested in exploring more on the differences in income between Blacks and Whites with bachelor's degrees. With more time and resources, I would like to test the hypothesis that being Black with a bachelor's degree in St. Louis confers less additional income relative to being White with a bachelor's degree. To test this hypothesis, I would execute a similar approach to this study; namely, I would utilize a multiple linear regression model with median income as the dependent variable for Blacks and Whites respectively with the bachelor's degree prop as the independent variable of interest. Overall, there is much more to explore in St. Louis related to race, income, and economic mobility.
+
+# Appendix
+
+# R Packages Used in this Analysis
+
+The analysis executed in this document utilized the following R packages: Tidyverse @Tidyverse, Tidycensus @TidyCensus, Tigris @Tigris, Segregation @Segregation, Sf @Sf, VIM @VIM, Mice @Mice, Scales @Scales, Car @Car, Stargazer @Stargazer, and Sandwich @Sandwich.
+
+## References
+
+::: {#refs}
+:::
+
+```         
+```
+
+### Table A
+
++----------------------------+--------------------------------------------------------------------------------------+
+| Variable                   | Description                                                                          |
++============================+======================================================================================+
+| ```                        | Estimated median black income                                                        |
+| medinc_blackE              |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimated median white income                                                        |
+| medinc_whiteE              |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total population that is white                                           |
+| whiteE                     |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total population that is black                                           |
+| blackE                     |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of number of home units owned by whites                                     |
+| white_owner_occupiedE      |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of units occupied by whites                                 |
+| white_occupied_housingE    |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of home units owned by blacks                                               |
+| black_owner_occupiedE      |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of units occupied by blacks                                 |
+| black_occupied_housingE    |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of white males with a bachelor's degree                     |
+| white_male_bachelorsE      |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of white females with a bachelor's degree                   |
+| white_female_bachelorsE    |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of whites age 25 and older                                  |
+| white_estimate_25_and_     |                                                                                      |
+| olderE                     |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of black males with a bachelor's degree                     |
+| black_male_bachelorsE      |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of black females with a bachelor's degree                   |
+| black_female_bachelorsE    |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of blacks age 25 and older                                  |
+| black_estimate_25_and_     |                                                                                      |
+| olderE                     |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of whites under 19 with health insurance                    |
+| white_under_19_health_     |                                                                                      |
+| insuranceE                 |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of whites age 19-64 with health insurance                   |
+| white_19_to_64_health_     |                                                                                      |
+| insuranceE                 |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of whites age 65 and older with health insurance            |
+| white_65_and_older_health_ |                                                                                      |
+| insuranceE                 |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of whites that are not instituitionalized                   |
+| white_noninstitutional     |                                                                                      |
+| ized_popE                  |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of blacks under 19 with health insurance                    |
+| black_under_19_health_     |                                                                                      |
+| insuranceE                 |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of blacks age 19-64 with health insurance                   |
+| black_19_to_64_health_     |                                                                                      |
+| insuranceE                 |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of blacks age 65 and older with health insurance            |
+| black_65_and_older_health_ |                                                                                      |
+| insuranceE                 |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of blacks that are not institutionalized                    |
+| black_noninstituitional    |                                                                                      |
+| ized_popE                  |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of households with a married couple that have children      |
+| married_household_w_       |                                                                                      |
+| childrenE                  |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of total number of households with a cohabitating couple that have children |
+| cohabitating_household_w_  |                                                                                      |
+| childrenE                  |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+| ```                        | Estimate of the total number of households with children                             |
+| toal_w_childrenE           |                                                                                      |
+| ```                        |                                                                                      |
++----------------------------+--------------------------------------------------------------------------------------+
+
+### Note A
+
+The following calculations were made to determine the variables used in the regression analysis that align to the key concepts:
+
+**white_owner_prop** = white_owner_occupiedE / white_occupied_housingE
+
+**black_owner_prop** = black_owner_occupiedE / black_occupied_housingE
+
+**white_bachelors_prop** = (white_male_bachelorsE + white_female_bachelorsE) / white_estimate_25_and_olderE
+
+**black_bachelors_prop** = (black_male_bachelorsE + black_female_bachelorsE) / black_estimate_25_and_olderE
+
+**black_health_insurance_coverage_prop** = (black_under_19_health_insuranceE + black_19_to_64_health_insuranceE + black_65_and_older_health_insuranceE) / black_noninstituitionalized_popE
+
+**white_health_insurance_coverage_prop** = (white_under_19_health_insuranceE + white_19_to_64_health_insuranceE + white_65_and_older_health_insuranceE) / white_noninstitutionalized_popE
+
+**parents_in_household_prop** = (married_household_w_childrenE + cohabitating_household_w_childrenE) / toal_w_childrenE
+
+**wealth_gap** = medinc_whiteE / medinc_blackE
+
+```{r}
+#| echo: false
+#| label: fig-a
+#| fig-cap: "Scatterplot of Actual Median Income Values in Blue and Imputed Median Black Income Values in Red. Imputed values computed using MICE @Mice. Graphic generated with VIM @VIM"
+xyplot(x = mice_imp, data = formula_fit,
+       xlab = 'Median White Income',
+       ylab = 'Median Black Income',
+       main = 'Scatterplot of Median Income')
+```
+
+```{r}
+#| echo: false
+#| label: fig-b
+#| fig-cap: "Density Plot of Actual Median Income Values in Blue and Imputed Median Income Values in Red for Median Black and White Income. Imputed values computed using MICE @Mice. Graphic generated with VIM @VIM"
+densityplot(x = mice_imp, data = medinc_blackE ~ medinc_whiteE + medinc_blackE)
+
+```
+
+![QQ Plot Indicates an Approximate Normality. Notable Differences are on the Tail Ends](qq_plot.png){#fig-c fig-align="center"}
+
+![Residuals vs. Fitted Plot Indicates Homoscedasticity](residuals_v_fitted.png){#fig-d fig-align="center"}
+
+![Scale Location Graph Indicates Approximate Homoscedasticity](scale_location.png){#fig-e fig-align="center"}
+
+![Residuals vs. Leverage Plot Indicates No Outliers as Measured by Cook's Distance](outliers.png){#fig-f fig-align="center"}
+
+## 
